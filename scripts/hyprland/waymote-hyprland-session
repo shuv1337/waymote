@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+# Waymote on the live Hyprland session, supervised by oxmgr (waymote-hyprland).
+# Start: drop to one 1920x1080@1x output for cheap capture, then run the gateway.
+# Stop (SIGTERM from `oxmgr stop`): stop the gateway, restore the dual display.
+set -Eeuo pipefail
+
+repo=/home/shuv/repos/waymote
+public_url=https://shuvdev.tail586a6d.ts.net:8240
+listen=127.0.0.1:8241
+export XDG_RUNTIME_DIR=/run/user/1000
+export XDG_SESSION_TYPE=wayland
+marker="$XDG_RUNTIME_DIR/waymote-single-output"
+# Never inherit a protected KRDP/Xwayland DISPLAY from the supervisor.
+unset DISPLAY XAUTHORITY
+
+log() { printf '[waymote-session] %s\n' "$*"; }
+
+# Wait for the sole live Hyprland compositor; never fall back to Labwc or a
+# stale Wayland socket after logout/restart.
+while :; do
+    instances=$(hyprctl instances -j 2>/dev/null || printf '[]')
+    count=$(jq -r 'length' <<< "$instances")
+    if [[ "$count" == 1 ]]; then
+        socket=$(jq -r '.[0].wl_socket // empty' <<< "$instances")
+        pid=$(jq -r '.[0].pid // empty' <<< "$instances")
+        if [[ "$socket" == wayland-* && -S "$XDG_RUNTIME_DIR/$socket" ]] && kill -0 "$pid" 2>/dev/null; then
+            export WAYLAND_DISPLAY="$socket"
+            export HYPRLAND_INSTANCE_SIGNATURE
+            HYPRLAND_INSTANCE_SIGNATURE=$(jq -r '.[0].instance' <<< "$instances")
+            break
+        fi
+    fi
+    sleep 2
+done
+
+if [[ -e "$XDG_RUNTIME_DIR/cua-one-output-profile" || -e "$HOME/.config/hypr/cua-trip-single" ]]; then
+    log 'A Cua one-output profile is active; run cua-one-output off/trip-off first' >&2
+    exit 1
+fi
+
+single_layout() {
+    hyprctl monitors -j | jq -e '
+        length == 1 and .[0].description == "Dell Inc. DELL S2722QC BY6ZH24" and
+        .[0].width == 1920 and .[0].height == 1080 and .[0].scale == 1 and
+        .[0].x == 0 and .[0].y == 0' >/dev/null
+}
+
+dual_layout() {
+    hyprctl monitors -j | jq -e '
+        length == 2 and
+        any(.[]; .description == "Dell Inc. DELL S2722QC 75DVLD3" and .scale == 1.5 and .x == 0 and .y == 0) and
+        any(.[]; .description == "Dell Inc. DELL S2722QC BY6ZH24" and .scale == 1.5 and .x == 2560 and .y == 0)' >/dev/null
+}
+
+wait_for() {
+    local check=$1
+    for _ in {1..20}; do
+        "$check" && return 0
+        sleep 0.25
+    done
+    return 1
+}
+
+reload_hyprland() {
+    hyprctl reload >/dev/null
+    local errors
+    errors=$(hyprctl configerrors)
+    [[ -z $errors ]] || { log "Hyprland config errors: $errors" >&2; return 1; }
+}
+
+gateway_pid=
+restore() {
+    local result=$?
+    trap - EXIT INT TERM HUP
+    if [[ -n $gateway_pid ]]; then
+        kill -TERM "$gateway_pid" 2>/dev/null || true
+        wait "$gateway_pid" 2>/dev/null || true
+    fi
+    rm -f -- "$marker"
+    if reload_hyprland && wait_for dual_layout; then
+        log 'Restored dual display'
+    else
+        log 'Dual display did not validate after reload; check hyprctl monitors' >&2
+        result=1
+    fi
+    exit "$result"
+}
+trap restore EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
+trap 'exit 129' HUP
+
+: > "$marker"
+reload_hyprland
+wait_for single_layout || { log 'Single 1920x1080 output was not established' >&2; exit 1; }
+# Capture stalls while the output is powered off.
+hyprctl eval 'hl.dispatch(hl.dsp.dpms({ action = "enable" }))' >/dev/null || true
+log 'Single display active: DP-1 1920x1080@60, scale 1'
+
+wayland_info=$(wayland-info 2>/dev/null)
+for protocol in zwlr_screencopy_manager_v1 zwlr_virtual_pointer_manager_v1 zwp_virtual_keyboard_manager_v1; do
+    grep -q "interface: '$protocol'" <<< "$wayland_info" || {
+        log "Hyprland does not expose $protocol" >&2
+        exit 1
+    }
+done
+
+"$repo/zig-out/bin/waymote-gateway" \
+    -listen "$listen" \
+    -public-url "$public_url" \
+    -streamd "$repo/zig-out/bin/waymote-streamd" \
+    -disable-resize \
+    -frame-rate 30 \
+    -encode-scale 100 \
+    -bitrate 6000 &
+gateway_pid=$!
+
+for _ in {1..40}; do
+    curl -fsS -o /dev/null "http://$listen/healthz" 2>/dev/null && break
+    kill -0 "$gateway_pid" 2>/dev/null || break
+    sleep 0.25
+done
+log "Waymote ready: $public_url"
+
+set +e
+wait "$gateway_pid"
+status=$?
+set -e
+gateway_pid=
+exit "$status"

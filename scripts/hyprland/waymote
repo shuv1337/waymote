@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# Start/stop the oxmgr-managed Waymote session and report where to connect.
+set -Eeuo pipefail
+
+name=waymote-hyprland
+public_url=https://shuvdev.tail586a6d.ts.net:8240
+health=http://127.0.0.1:8241/healthz
+marker="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/waymote-single-output"
+
+running() { oxmgr status "$name" 2>/dev/null | grep -q '^Status: *running'; }
+
+case "${1:-}" in
+  start)
+    # `oxmgr start` only registers new processes; restart also starts a stopped one.
+    oxmgr restart "$name" >/dev/null
+    for _ in {1..60}; do
+      if curl -fsS -o /dev/null "$health" 2>/dev/null; then
+        printf 'Waymote running (single display, 1920x1080)\n  %s\n' "$public_url"
+        exit 0
+      fi
+      running || break
+      sleep 0.5
+    done
+    echo 'Waymote did not become healthy; recent log:' >&2
+    oxmgr logs "$name" 2>&1 | grep -v 'Resumed reading' | tail -n 15 >&2
+    exit 1
+    ;;
+  stop)
+    oxmgr stop "$name" >/dev/null
+    for _ in {1..40}; do
+      [[ -e $marker ]] || { echo 'Waymote stopped; dual display restored'; exit 0; }
+      sleep 0.5
+    done
+    echo "Waymote stopped, but $marker remains; dual display may not be restored" >&2
+    exit 1
+    ;;
+  status)
+    if running && curl -fsS -o /dev/null "$health" 2>/dev/null; then
+      printf 'running  %s\n' "$public_url"
+    else
+      echo stopped
+    fi
+    ;;
+  url) echo "$public_url" ;;
+  *) echo 'Usage: waymote {start|stop|status|url}' >&2; exit 2 ;;
+esac
