@@ -656,6 +656,29 @@ func TestValidResizeControlRecord(t *testing.T) {
 	}
 }
 
+func TestDisableResizeOnlyDropsResize(t *testing.T) {
+	for _, command := range []byte{controlResize, controlPointerMotion, controlReleaseAll} {
+		record := makeControlRecord(command, false, 1280, 720, 120)
+		if got, want := mayForwardControlRecord(record, true), command != controlResize; got != want {
+			t.Fatalf("command %d: mayForwardControlRecord() = %t, want %t", command, got, want)
+		}
+		if !mayForwardControlRecord(record, false) {
+			t.Fatalf("command %d should be forwarded when resizing is enabled", command)
+		}
+	}
+}
+
+func TestQualityRecoveryRespectsEncodeScaleCap(t *testing.T) {
+	now := time.Now()
+	policy := qualityPolicy{bitrate: 6000, fps: 10, scale: 50, maxBitrate: 6000, maxFPS: 10, maxScale: 50, last: now.Add(-time.Hour)}
+	for i := 0; i < 20; i++ {
+		policy.update(0, 0, 20, now.Add(time.Duration(i)*time.Second))
+	}
+	if policy.scale != 50 {
+		t.Fatalf("quality scale recovered past cap: %d", policy.scale)
+	}
+}
+
 func TestFixedResizeRecord(t *testing.T) {
 	original := makeControlRecord(controlResize, false, 1920, 1080, 150)
 	fixed := fixedResizeRecord(original, 1280, 720)

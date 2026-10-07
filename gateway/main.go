@@ -250,6 +250,7 @@ type gateway struct {
 	allowedOrigin string
 	fixedWidth    uint32
 	fixedHeight   uint32
+	disableResize bool
 	nextClientID  atomic.Uint64
 	controllerMu  sync.Mutex
 	controller    bool
@@ -281,6 +282,7 @@ func (b *messageBridge) publish(m []byte) {
 type qualityPolicy struct {
 	bitrate, fps, scale uint32
 	maxBitrate, maxFPS  uint32
+	maxScale            uint32
 	bad, good           int
 	// Lowest positive RTT the current controller reported recently, or zero
 	// before the first measurement. Congestion is judged relative to it. The
@@ -394,8 +396,12 @@ func (p *qualityPolicy) update(queue uint32, dropped uint64, rtt float64, now ti
 		p.good = 0
 		bitrate, fps, scale := p.bitrate, p.fps, p.scale
 		p.bitrate = min(p.maxBitrate, p.bitrate*110/100)
-		if p.scale < 100 {
-			p.scale += 25
+		maxScale := p.maxScale
+		if maxScale == 0 {
+			maxScale = 100
+		}
+		if p.scale < maxScale {
+			p.scale = min(maxScale, p.scale+25)
 		} else if p.fps < p.maxFPS {
 			p.fps = min(p.maxFPS, p.fps+10)
 		}
@@ -852,6 +858,9 @@ func (g *gateway) control(w http.ResponseWriter, r *http.Request) {
 		if !controlling {
 			continue
 		}
+		if !mayForwardControlRecord(message, g.disableResize) {
+			continue
+		}
 		message = fixedResizeRecord(message, g.fixedWidth, g.fixedHeight)
 		if err := g.input.write(message); err != nil {
 			log.Printf("control client %d input write failed: %v", clientID, err)
@@ -1040,6 +1049,10 @@ func releaseAllRecord() []byte {
 	return record
 }
 
+func mayForwardControlRecord(record []byte, disableResize bool) bool {
+	return !disableResize || record[1] != controlResize
+}
+
 func fixedResizeRecord(record []byte, width, height uint32) []byte {
 	if width == 0 || len(record) != controlSize || record[1] != controlResize {
 		return record
@@ -1057,8 +1070,10 @@ func main() {
 	streamdPath := flag.String("streamd", "waymote-streamd", "path to waymote-streamd")
 	frameRate := flag.Uint64("frame-rate", 30, "capture and encoder frame rate")
 	bitrate := flag.Uint64("bitrate", 12000, "encoder target bitrate in kbps")
+	encodeScale := flag.Uint64("encode-scale", 100, "maximum encoded-size percentage (50-100)")
 	fixedWidth := flag.Uint("fixed-width", 0, "fixed output width (zero allows client resizing)")
 	fixedHeight := flag.Uint("fixed-height", 0, "fixed output height (zero allows client resizing)")
+	disableResize := flag.Bool("disable-resize", false, "ignore remote output-size requests")
 	audioSource := flag.String("audio-source", os.Getenv("WAYMOTE_AUDIO_SOURCE"), "PulseAudio monitor source (empty disables audio)")
 	xkbLayout := flag.String("xkb-layout", os.Getenv("XKB_DEFAULT_LAYOUT"), "XKB keyboard layout")
 	publicURL := flag.String("public-url", os.Getenv("PUBLIC_URL"), "public gateway URL allowed as a WebSocket origin")
@@ -1073,6 +1088,9 @@ func main() {
 	}
 	if *bitrate < 100 || *bitrate > 200_000 {
 		log.Fatal("bitrate must be between 100 and 200000 kbps")
+	}
+	if *encodeScale < 50 || *encodeScale > 100 {
+		log.Fatal("encode-scale must be between 50 and 100 percent")
 	}
 	if (*fixedWidth == 0) != (*fixedHeight == 0) ||
 		*fixedWidth != 0 && (*fixedWidth < minimumOutputWidth ||
@@ -1108,7 +1126,7 @@ func main() {
 	clipboard := &clipboardBridge{}
 	events := &messageBridge{}
 	go func() {
-		if err := runEncoder(ctx, hub, audio, input, clipboard, events, *streamdPath, *frameRate, *bitrate, *xkbLayout, *audioSource); err != nil && !errors.Is(err, context.Canceled) {
+		if err := runEncoder(ctx, hub, audio, input, clipboard, events, *streamdPath, *frameRate, *bitrate, *encodeScale, *xkbLayout, *audioSource); err != nil && !errors.Is(err, context.Canceled) {
 			log.Printf("stream encoder stopped: %v", err)
 			stop()
 		}
@@ -1132,9 +1150,10 @@ func main() {
 		allowedOrigin: allowedOrigin,
 		fixedWidth:    uint32(*fixedWidth),
 		fixedHeight:   uint32(*fixedHeight),
+		disableResize: *disableResize,
 		quality: qualityPolicy{
-			bitrate: uint32(*bitrate), fps: uint32(*frameRate), scale: 100,
-			maxBitrate: uint32(*bitrate), maxFPS: uint32(*frameRate),
+			bitrate: uint32(*bitrate), fps: uint32(*frameRate), scale: uint32(*encodeScale),
+			maxBitrate: uint32(*bitrate), maxFPS: uint32(*frameRate), maxScale: uint32(*encodeScale),
 		},
 		events: events,
 	}
@@ -1216,6 +1235,7 @@ func runEncoder(
 	streamdPath string,
 	frameRate uint64,
 	bitrate uint64,
+	encodeScale uint64,
 	xkbLayout string,
 	audioSource string,
 ) error {
@@ -1229,6 +1249,8 @@ func runEncoder(
 		strconv.FormatUint(frameRate, 10),
 		"--bitrate",
 		strconv.FormatUint(bitrate, 10),
+		"--encoded-scale",
+		strconv.FormatUint(encodeScale, 10),
 		"--rtp-port",
 		strconv.Itoa(rtpPort),
 		"--xkb-layout",

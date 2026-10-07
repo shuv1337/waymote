@@ -50,6 +50,7 @@ const usage =
     \\  --ffmpeg PATH       FFmpeg executable (default: ffmpeg)
     \\  --frame-rate FPS    encoder frame rate (default: 30)
     \\  --bitrate KBPS      encoder target bitrate (default: 12000)
+    \\  --encoded-scale PCT encoder size as a percent of captured output (50-100, default: 100)
     \\  --rtp-port PORT     send H.264 RTP to a loopback UDP port
     \\  --audio-rtp-port PORT
     \\                      send Opus RTP to a loopback UDP port
@@ -992,6 +993,13 @@ fn parseArguments(arguments: anytype) !Options {
             if (options.bitrate_kbps < 100 or options.bitrate_kbps > 200_000) {
                 return error.InvalidBitrate;
             }
+        } else if (std.mem.eql(u8, argument, "--encoded-scale")) {
+            const value = arguments.next() orelse return error.MissingArgument;
+            options.encoded_scale = std.fmt.parseInt(u32, value, 10) catch
+                return error.InvalidEncodedScale;
+            if (options.encoded_scale < 50 or options.encoded_scale > 100) {
+                return error.InvalidEncodedScale;
+            }
         } else if (std.mem.eql(u8, argument, "--rtp-port")) {
             const value = arguments.next() orelse return error.MissingArgument;
             options.rtp_port = std.fmt.parseInt(u16, value, 10) catch
@@ -1044,11 +1052,14 @@ test "stream options parse encoder settings" {
         "30",
         "--bitrate",
         "8000",
+        "--encoded-scale",
+        "50",
     } };
     const options = try parseArguments(&arguments);
     try std.testing.expectEqualStrings("/usr/bin/ffmpeg", options.ffmpeg_path);
     try std.testing.expectEqual(@as(u32, 30), options.frame_rate);
     try std.testing.expectEqual(@as(u32, 8000), options.bitrate_kbps);
+    try std.testing.expectEqual(@as(u32, 50), options.encoded_scale);
 
     var version: TestArguments = .{ .values = &.{"--version"} };
     try std.testing.expect((try parseArguments(&version)).version);
@@ -1057,6 +1068,8 @@ test "stream options parse encoder settings" {
 test "stream options reject unsafe rates" {
     var arguments: TestArguments = .{ .values = &.{ "--frame-rate", "0" } };
     try std.testing.expectError(error.InvalidFrameRate, parseArguments(&arguments));
+    var scale: TestArguments = .{ .values = &.{ "--encoded-scale", "49" } };
+    try std.testing.expectError(error.InvalidEncodedScale, parseArguments(&scale));
 }
 
 test "stream options accept a loopback RTP port" {
