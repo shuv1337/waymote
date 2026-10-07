@@ -19,9 +19,8 @@ const imeProxy = document.querySelector("#ime-proxy");
 
 const session = new WaymoteSession({
   latency: Number(latency.value),
-  // Keep the shared demo at one resolution: multiple portal viewers can take
-  // input control in turn, but must not repeatedly reconfigure one encoder.
-  remoteDisplay: { mode: "fixed", width: 1280, height: 720, scale: 1 },
+  // This deployment views a live desktop: never resize its physical outputs.
+  remoteDisplay: { mode: "manual" },
 });
 const surface = session.attachSurface({
   canvas: display,
